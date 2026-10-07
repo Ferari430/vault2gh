@@ -29,7 +29,8 @@ const usage = `vault2gh — публикация хранилища Obsidian н�
       Обработать хранилище и отправить в репозиторий. Если репозитория нет,
       он создаётся (приватным). Репозиторий становится копией хранилища:
       удалённые из хранилища файлы удаляются и из репозитория (кроме .github/).
-      Токен: --token, переменная GITHUB_TOKEN или ввод с клавиатуры.
+      Токен: переменная GITHUB_TOKEN, --token, --token-stdin или скрытый ввод
+      в терминале.
 
   vault2gh export <папка|архив.zip> <папка-результат>
       Сделать то же преобразование локально, без GitHub — посмотреть результат
@@ -43,8 +44,19 @@ const usage = `vault2gh — публикация хранилища Obsidian н�
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	// Первый Ctrl+C отменяет работу штатно, после него возвращаем обычное
+	// поведение сигналов: второй Ctrl+C завершает программу сразу.
+	go func() {
+		<-ctx.Done()
+		stop()
+	}()
+
 	if err := run(ctx, os.Args[1:]); err != nil {
-		if !errors.Is(err, flag.ErrHelp) {
+		switch {
+		case errors.Is(err, flag.ErrHelp):
+		case errors.Is(err, context.Canceled):
+			fmt.Fprintln(os.Stderr, "прервано")
+		default:
 			fmt.Fprintln(os.Stderr, "ошибка:", err)
 		}
 		os.Exit(1)
@@ -79,6 +91,7 @@ func cmdPush(ctx context.Context, args []string) error {
 	message := fs.String("m", "", "сообщение коммита")
 	attachments := fs.String("attachments", vault.DefaultAttachmentsDir, "папка для картинок в репозитории")
 	token := fs.String("token", "", "GitHub-токен (надёжнее через GITHUB_TOKEN: флаг остаётся в истории shell)")
+	tokenStdin := fs.Bool("token-stdin", false, `прочитать токен из stdin: echo "$T" | vault2gh push … --token-stdin`)
 	pos, err := parse(fs, args)
 	if err != nil {
 		return err
@@ -87,7 +100,7 @@ func cmdPush(ctx context.Context, args []string) error {
 		return errors.New("использование: vault2gh push <папка|архив.zip> --repo <имя>")
 	}
 
-	tok, err := readToken(*token)
+	tok, err := readToken(ctx, os.Stdin, *token, *tokenStdin)
 	if err != nil {
 		return err
 	}
@@ -178,34 +191,75 @@ func parse(fs *flag.FlagSet, args []string) ([]string, error) {
 	}
 }
 
-// readToken берёт токен из флага, GITHUB_TOKEN, скрытого ввода в терминале
-// или первой строки stdin (echo "$T" | vault2gh push …).
-func readToken(flagValue string) (string, error) {
+// readToken берёт токен из флага --token, из stdin (--token-stdin), из
+// GITHUB_TOKEN или спрашивает в терминале со скрытым вводом. Без терминала
+// молча ждать ввод нельзя — со стороны это выглядит как зависание с пустым
+// выводом, поэтому сразу возвращается ошибка.
+func readToken(ctx context.Context, stdin *os.File, flagValue string, fromStdin bool) (string, error) {
 	if flagValue != "" {
 		return flagValue, nil
 	}
-	if t := os.Getenv("GITHUB_TOKEN"); t != "" {
+	if t := os.Getenv("GITHUB_TOKEN"); t != "" && !fromStdin {
 		return t, nil
 	}
-	fd := int(os.Stdin.Fd())
+
+	fd := int(stdin.Fd())
 	var t string
-	if term.IsTerminal(fd) {
-		fmt.Fprint(os.Stderr, "GitHub-токен (ввод скрыт): ")
-		b, err := term.ReadPassword(fd)
-		fmt.Fprintln(os.Stderr)
-		if err != nil {
-			return "", err
+	var err error
+	switch {
+	case term.IsTerminal(fd):
+		t, err = promptHidden(ctx, fd)
+	case fromStdin:
+		r := bufio.NewReader(stdin)
+		t, err = readCtx(ctx, func() (string, error) { return r.ReadString('\n') })
+		if errors.Is(err, io.EOF) {
+			err = nil
 		}
-		t = string(b)
-	} else {
-		line, err := bufio.NewReader(os.Stdin).ReadString('\n')
-		if err != nil && !errors.Is(err, io.EOF) {
-			return "", err
-		}
-		t = line
+	default:
+		return "", errors.New("токен не задан, а терминала для ввода нет: задайте GITHUB_TOKEN в той же команде " +
+			"(GITHUB_TOKEN=... vault2gh push …), передайте его через --token-stdin или запустите в обычном терминале")
+	}
+	if err != nil {
+		return "", err
 	}
 	if t = strings.TrimSpace(t); t == "" {
-		return "", errors.New("токен не задан: используйте GITHUB_TOKEN, --token или введите его при запуске")
+		return "", errors.New("введён пустой токен")
 	}
 	return t, nil
+}
+
+func promptHidden(ctx context.Context, fd int) (string, error) {
+	state, err := term.GetState(fd)
+	if err != nil {
+		return "", err
+	}
+	fmt.Fprint(os.Stderr, "GitHub-токен (ввод скрыт): ")
+	t, err := readCtx(ctx, func() (string, error) {
+		b, err := term.ReadPassword(fd)
+		return string(b), err
+	})
+	fmt.Fprintln(os.Stderr)
+	if err != nil {
+		term.Restore(fd, state) // если ввод прервали, ReadPassword не успел вернуть эхо
+	}
+	return t, err
+}
+
+// readCtx выполняет блокирующее чтение в горутине, чтобы Ctrl+C его прерывал.
+func readCtx(ctx context.Context, read func() (string, error)) (string, error) {
+	type result struct {
+		s   string
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		s, err := read()
+		ch <- result{s, err}
+	}()
+	select {
+	case r := <-ch:
+		return r.s, r.err
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
 }
