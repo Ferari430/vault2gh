@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"strings"
 	"syscall"
 
@@ -39,7 +40,24 @@ const usage = `vault2gh — публикация хранилища Obsidian н�
   vault2gh bot
       Запустить Telegram-бота. Токен бота — в переменной TELEGRAM_BOT_TOKEN.
 
+  vault2gh version
+      Показать версию.
+
 Запустите "vault2gh <команда> -h", чтобы увидеть флаги команды.`
+
+// version подставляется при сборке релиза: -ldflags "-X main.version=v0.1.0".
+var version = "dev"
+
+// versionString для сборок через go install берёт версию модуля из сборочной информации.
+func versionString() string {
+	if version != "dev" {
+		return version
+	}
+	if bi, ok := debug.ReadBuildInfo(); ok && bi.Main.Version != "" && bi.Main.Version != "(devel)" {
+		return bi.Main.Version
+	}
+	return version
+}
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -75,6 +93,9 @@ func run(ctx context.Context, args []string) error {
 		return cmdExport(args[1:])
 	case "bot":
 		return cmdBot(ctx, args[1:])
+	case "version", "--version":
+		fmt.Println("vault2gh", versionString())
+		return nil
 	case "help", "-h", "--help":
 		fmt.Println(usage)
 		return nil
